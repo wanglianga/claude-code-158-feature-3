@@ -3,14 +3,17 @@ package com.wasteoil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wasteoil.audit.AuditLogRepository;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
@@ -37,6 +40,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @AutoConfigureMockMvc
 @EmbeddedKafka(partitions = 1)
 @ActiveProfiles("test")
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class EndToEndIntegrationTest {
 
@@ -48,10 +52,45 @@ class EndToEndIntegrationTest {
     ObjectMapper om;
     @Autowired
     AuditLogRepository auditLogRepository;
+    @Autowired
+    JdbcTemplate jdbc;
 
     // 跨用例共享的主流程产物
     static long happyManifestId;
     static long happyDispatchId;
+    // 长期无回收门店 4 的现场检查任务（巡查扫描自动生成）
+    static long noRecyclingTaskId;
+
+    /**
+     * 重置全部交易数据并复位基础数据状态，保证测试套件在同一持久测试库上可重复执行
+     * （Flyway 只迁移不清数据；基础主数据 stores/merchants/barrels 等由种子迁移保留）。
+     */
+    @BeforeAll
+    void resetTransactionalData() {
+        // 先清引用联单/派单的子表，再清主表
+        jdbc.update("DELETE FROM weighing_records");
+        jdbc.update("DELETE FROM track_points");
+        jdbc.update("DELETE FROM pickup_verifications");
+        jdbc.update("DELETE FROM plant_receipts");
+        jdbc.update("DELETE FROM inspections");
+        jdbc.update("DELETE FROM disputes");
+        jdbc.update("DELETE FROM exception_tickets");
+        jdbc.update("DELETE FROM settlements");
+        jdbc.update("DELETE FROM manifests");
+        jdbc.update("DELETE FROM dispatch_orders");
+        jdbc.update("DELETE FROM appointments");
+        jdbc.update("DELETE FROM audit_logs");
+        jdbc.update("DELETE FROM risk_entries");
+        jdbc.update("DELETE FROM site_inspection_tasks");
+        jdbc.update("DELETE FROM store_risk_profiles");
+        // 复位油桶为在店、演示门店 4 为"开业 40 天从未回收"
+        jdbc.update("UPDATE barrels SET status = 'AT_STORE', updated_at = now()");
+        jdbc.update("UPDATE stores SET status = 'ACTIVE'");
+        jdbc.update("UPDATE stores SET created_at = now() - interval '40 days' WHERE id = 4");
+        jdbc.update("UPDATE weighing_devices SET status = 'ONLINE', last_heartbeat_at = now()");
+        jdbc.update("ALTER SEQUENCE manifest_no_seq RESTART WITH 1");
+        jdbc.update("ALTER SEQUENCE site_inspection_no_seq RESTART WITH 1");
+    }
 
     // ---------- 工具方法 ----------
 
@@ -437,5 +476,146 @@ class EndToEndIntegrationTest {
 
         JsonNode trend = getJson("/api/reports/regulator/trend", "REGULATOR", 200);
         assertThat(trend.path("data").size()).isGreaterThanOrEqualTo(1);
+    }
+
+    // ---------- 监管抽查追踪扩展 ----------
+
+    @Test
+    @Order(40)
+    void 监管链路追踪_按商户日期批次组装完整链路() throws Exception {
+        String today = LocalDate.now(ZONE).toString();
+        JsonNode chain = getJson("/api/regulatory/chains?storeId=1&date=" + today, "REGULATOR", 200);
+        JsonNode stores = chain.path("data").path("stores");
+        assertThat(stores.size()).isGreaterThanOrEqualTo(1);
+        JsonNode storeChain = stores.get(0);
+        assertThat(storeChain.path("storeId").asLong()).isEqualTo(1L);
+        assertThat(storeChain.path("batchCount").asInt()).isGreaterThanOrEqualTo(1);
+        // 找到主流程联单对应的批次
+        JsonNode batch = null;
+        for (JsonNode b : storeChain.path("batches")) {
+            if (b.path("manifestId").asLong() == happyManifestId) {
+                batch = b;
+            }
+        }
+        assertThat(batch).isNotNull();
+        // 预约 / 司机 / 车辆 / 到厂联单 / 结算 全链路齐备
+        assertThat(batch.path("appointment").path("id").asLong()).isPositive();
+        assertThat(batch.path("driver").path("name").asText()).isEqualTo("张师傅");
+        assertThat(batch.path("vehicle").path("plateNo").asText()).isEqualTo("川A12345");
+        assertThat(batch.path("plant").path("name").asText()).contains("处置厂");
+        assertThat(batch.path("receipt").path("decision").asText()).isEqualTo("ACCEPT");
+        assertThat(batch.path("settlement").path("amount").asDouble()).isEqualTo(950.40);
+        assertThat(batch.path("weighingCount").asInt()).isEqualTo(2);
+        assertThat(batch.path("trackCount").asInt()).isEqualTo(2);
+
+        // 必须指定查询范围
+        getJson("/api/regulatory/chains?date=" + today, "REGULATOR", 400);
+        // 非监管无权
+        getJson("/api/regulatory/chains?storeId=1&date=" + today, "MERCHANT", 403);
+    }
+
+    @Test
+    @Order(41)
+    void 巡查扫描_长期无回收_疑似违规并生成现场检查任务() throws Exception {
+        JsonNode scan = postJson("/api/regulatory/patrol/scan", "REGULATOR", "regulator-1", "{}", 200);
+        // 种子门店 4 开业 40 天从未回收，至少生成 1 个任务
+        assertThat(scan.path("data").path("tasksCreated").asInt()).isGreaterThanOrEqualTo(1);
+
+        JsonNode tasks = getJson("/api/regulatory/tasks?storeId=4", "REGULATOR", 200);
+        assertThat(tasks.path("data").size()).isGreaterThanOrEqualTo(1);
+        JsonNode task = tasks.path("data").get(0);
+        assertThat(task.path("status").asText()).isEqualTo("PENDING");
+        assertThat(task.path("source").asText()).isEqualTo("RISK_SCAN");
+        assertThat(task.path("reason").asText()).contains("无合规回收");
+        assertThat(task.path("daysNoRecycling").asInt()).isGreaterThanOrEqualTo(30);
+        noRecyclingTaskId = task.path("id").asLong();
+
+        JsonNode profile = getJson("/api/regulatory/risk-profiles/4", "REGULATOR", 200);
+        assertThat(profile.path("data").path("riskLevel").asText()).isEqualTo("WATCH");
+        assertThat(profile.path("data").path("riskScore").asInt()).isEqualTo(50);
+        assertThat(profile.path("data").path("keyPatrol").asBoolean()).isFalse();
+    }
+
+    @Test
+    @Order(42)
+    void 回填现场检查_认定违规责令整改_进入重点巡查名单() throws Exception {
+        // 缺少检查照片 → 400
+        postJson("/api/regulatory/tasks/" + noRecyclingTaskId + "/fill", "REGULATOR", "regulator-1", """
+                {"checkResult": "NON_COMPLIANT", "photoUrls": [],
+                 "interviewResult": "约谈老板", "rectifyDeadline": "%s"}
+                """.formatted(LocalDate.now(ZONE).plusDays(7)), 400);
+
+        JsonNode filled = postJson("/api/regulatory/tasks/" + noRecyclingTaskId + "/fill",
+                "REGULATOR", "regulator-1", """
+                {"checkResult": "NON_COMPLIANT",
+                 "photoUrls": ["https://img.example.com/site-1.jpg", "https://img.example.com/site-2.jpg"],
+                 "interviewResult": "现场约谈：老板承认废油交无资质收运人，责令改正",
+                 "rectifyDeadline": "%s"}
+                """.formatted(LocalDate.now(ZONE).plusDays(7)), 200);
+        assertThat(filled.path("data").path("status").asText()).isEqualTo("RECTIFYING");
+        assertThat(filled.path("data").path("photoUrls").asText()).contains("site-1.jpg");
+        assertThat(filled.path("data").path("inspectedAt").asText()).isNotBlank();
+
+        JsonNode keyPatrol = getJson("/api/regulatory/risk-profiles/key-patrol", "REGULATOR", 200);
+        boolean containsStore4 = false;
+        for (JsonNode p : keyPatrol.path("data")) {
+            if (p.path("storeId").asLong() == 4L) {
+                containsStore4 = true;
+                assertThat(p.path("riskLevel").asText()).isEqualTo("KEY");
+            }
+        }
+        assertThat(containsStore4).isTrue();
+    }
+
+    @Test
+    @Order(43)
+    void 再次巡查仍无记录_不重复生成任务且维持重点巡查() throws Exception {
+        JsonNode scan = postJson("/api/regulatory/patrol/scan", "REGULATOR", "regulator-1", "{}", 200);
+        assertThat(scan.path("data").path("tasksCreated").asInt()).isZero();
+        JsonNode profile = getJson("/api/regulatory/risk-profiles/4", "REGULATOR", 200);
+        assertThat(profile.path("data").path("riskLevel").asText()).isEqualTo("KEY");
+        assertThat(profile.path("data").path("keyPatrol").asBoolean()).isTrue();
+    }
+
+    @Test
+    @Order(44)
+    void 恢复正常回收后两轮巡查_风险逐步下降并复核关闭任务() throws Exception {
+        // 门店 4 完成一次完整合规回收闭环
+        postJson("/api/weighings/devices/DEV-004/heartbeat", "RECYCLER", "recycler-1", "{}", 200);
+        long appointmentId = createAppointment(4, 1, "100");
+        long dispatchId = planDispatch(appointmentId, tomorrowAt(10, 0), tomorrowAt(10, 30));
+        arriveAndVerify(dispatchId, "STORE-QR-4", "DEV-004");
+        postJson("/api/weighings", "DRIVER", "driver-1", """
+                {"dispatchId": %d, "barrelCode": "BAR-301", "weightKg": 90, "deviceCode": "DEV-004",
+                 "source": "DEVICE", "handoverName": "赵老板"}
+                """.formatted(dispatchId), 200);
+        postJson("/api/dispatches/" + dispatchId + "/load-complete", "DRIVER", "driver-1", "{}", 200);
+        uploadTracksAndArrivePlant(dispatchId);
+        long manifestId = manifestIdOf(dispatchId);
+        postJson("/api/receipts", "PLANT", "plant-1", """
+                {"manifestId": %d, "arrivalWeightKg": 90, "barrelCount": 1,
+                 "qualityCheck": "OK", "decision": "ACCEPT", "receivedBy": "厂验收员"}
+                """.formatted(manifestId), 200);
+        assertThat(getJson("/api/manifests/" + manifestId, "REGULATOR", 200)
+                .path("data").path("manifest").path("status").asText()).isEqualTo("CLOSED");
+
+        // 第一轮巡查：风险分 80 → 40，退出重点巡查，仍为 WATCH
+        postJson("/api/regulatory/patrol/scan", "REGULATOR", "regulator-1", "{}", 200);
+        JsonNode first = getJson("/api/regulatory/risk-profiles/4", "REGULATOR", 200);
+        assertThat(first.path("data").path("riskScore").asInt()).isEqualTo(40);
+        assertThat(first.path("data").path("riskLevel").asText()).isEqualTo("WATCH");
+        assertThat(first.path("data").path("keyPatrol").asBoolean()).isFalse();
+
+        // 第二轮巡查：风险清零恢复正常
+        postJson("/api/regulatory/patrol/scan", "REGULATOR", "regulator-1", "{}", 200);
+        JsonNode second = getJson("/api/regulatory/risk-profiles/4", "REGULATOR", 200);
+        assertThat(second.path("data").path("riskScore").asInt()).isZero();
+        assertThat(second.path("data").path("riskLevel").asText()).isEqualTo("NORMAL");
+
+        // 整改复核通过，任务关闭
+        JsonNode closed = postJson("/api/regulatory/tasks/" + noRecyclingTaskId + "/verify",
+                "REGULATOR", "regulator-1",
+                "{\"passed\": true, \"closeNote\": \"已签订合规收运合同并恢复交运，复核通过\"}", 200);
+        assertThat(closed.path("data").path("status").asText()).isEqualTo("VERIFIED_CLOSED");
     }
 }

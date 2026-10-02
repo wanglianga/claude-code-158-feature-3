@@ -1,5 +1,9 @@
-# 有 Docker 的开发机可用本文件一键起依赖；应用本身用 mvn spring-boot:run 启动。
-# 注意：compose 中 PG 端口映射为 5433，与 application.yml 默认配置一致。
+# 一键启动整套服务：docker compose up -d --build
+# - postgres：PostgreSQL 15，映射到宿主机 5433（便于无 Docker 的本地脚本/直连调试）
+# - kafka：Kafka 3.8 KRaft，宿主机用 localhost:9092，compose 内部网络用 kafka:9094
+# - app：Spring Boot 应用，Flyway 自动建表并写入演示数据，http://localhost:8080
+#        Swagger UI：http://localhost:8080/swagger-ui/index.html
+# 无 Docker 的环境可用 scripts/start-local.sh（本机进程方式）。
 services:
   postgres:
     image: postgres:15
@@ -22,15 +26,40 @@ services:
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,DOCKER://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,DOCKER://kafka:9094
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,DOCKER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     ports:
       - "9092:9092"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9092"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: waste-oil-tracking:1.0.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      # 容器网络内使用服务名与容器内原生端口
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/wasteoil
+      SPRING_DATASOURCE_USERNAME: wasteoil
+      SPRING_DATASOURCE_PASSWORD: wasteoil123
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+    ports:
+      - "8080:8080"
 
 volumes:
   pgdata:

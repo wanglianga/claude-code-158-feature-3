@@ -33,4 +33,13 @@ public class WasteOilProperties {
 
     /** 产量/预期比值阈值 */
     private BigDecimal riskYieldRatio = new BigDecimal("0.3");
+
+    /** 巡查：连续多少天无合规回收即标记疑似违规（WATCH）并生成现场检查任务 */
+    private int patrolWatchDays = 30;
+
+    /** 巡查：连续多少天无合规回收即列入重点巡查名单（KEY） */
+    private int patrolKeyDays = 60;
+
+    /** 巡查：恢复正常回收后连续多少次巡查确认即解除风险状态 */
+    private int patrolRecoverScans = 2;
 }

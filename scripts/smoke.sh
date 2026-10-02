@@ -147,7 +147,83 @@ check "商户回收证明联单数≥1" "$(python3 -c "import sys,json;print(jso
 TREND=$(req GET /api/reports/regulator/trend REGULATOR regulator-1)
 check "监管趋势报表" "$(python3 -c "import sys,json;print(len(json.load(sys.stdin)['data'])>0)" <<< "$TREND")" "True"
 
-echo "=== 9. Kafka 事件审计流水 ==="
+echo "=== 9. 监管抽查追踪：链路 / 疑似违规 / 现场检查回填 / 风险降级 ==="
+SH_DATE=$(python3 -c "from datetime import datetime;from zoneinfo import ZoneInfo;print(datetime.now(ZoneInfo('Asia/Shanghai')).date())")
+CHAIN=$(req GET "/api/regulatory/chains?storeId=1&date=$SH_DATE" REGULATOR regulator-1)
+check "链路按商户+日期返回门店" "$(python3 -c "import sys,json;print(json.load(sys.stdin)['data']['storeCount']>=1)" <<< "$CHAIN")" "True"
+check "链路批次包含主流程联单" "$(python3 -c "
+import sys,json
+d=json.load(sys.stdin)['data']
+print(any(any(b['manifestId']==$MID for b in s['batches']) for s in d['stores']))" <<< "$CHAIN")" "True"
+check "批次司机为张师傅" "$(python3 -c "
+import sys,json
+d=json.load(sys.stdin)['data']
+print(next(b['driver']['name'] for s in d['stores'] for b in s['batches'] if b['manifestId']==$MID))" <<< "$CHAIN")" "张师傅"
+check "批次车辆为川A12345" "$(python3 -c "
+import sys,json
+d=json.load(sys.stdin)['data']
+print(next(b['vehicle']['plateNo'] for s in d['stores'] for b in s['batches'] if b['manifestId']==$MID))" <<< "$CHAIN")" "川A12345"
+check "批次结算金额 950.4" "$(python3 -c "
+import sys,json
+d=json.load(sys.stdin)['data']
+print(next(str(b['settlement']['amount']) for s in d['stores'] for b in s['batches'] if b['manifestId']==$MID))" <<< "$CHAIN")" "950.4"
+
+# 巡查扫描：种子门店 4（开业 40 天从未回收）应被标记疑似违规并生成现场检查任务
+SCAN=$(req POST /api/regulatory/patrol/scan REGULATOR regulator-1 '{}')
+check "巡查扫描生成现场检查任务(≥1)" "$(python3 -c "import sys,json;print(json.load(sys.stdin)['data']['tasksCreated']>=1)" <<< "$SCAN")" "True"
+TASK=$(req GET "/api/regulatory/tasks?storeId=4" REGULATOR regulator-1)
+check "门店4任务状态 PENDING" "$(jget "['data'][0]['status']" <<< "$TASK")" "PENDING"
+check "任务来源 RISK_SCAN" "$(jget "['data'][0]['source']" <<< "$TASK")" "RISK_SCAN"
+SI=$(jget "['data'][0]['id']" <<< "$TASK")
+PROFILE=$(req GET /api/regulatory/risk-profiles/4 REGULATOR regulator-1)
+check "门店4风险等级 WATCH" "$(jget "['data']['riskLevel']" <<< "$PROFILE")" "WATCH"
+check "门店4风险分 50" "$(jget "['data']['riskScore']" <<< "$PROFILE")" "50"
+
+# 回填现场检查：缺照片被拒
+CODE2=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/regulatory/tasks/$SI/fill" -H "X-Role: REGULATOR" -H "Content-Type: application/json" \
+  -d '{"checkResult":"NON_COMPLIANT","photoUrls":[],"interviewResult":"约谈","rectifyDeadline":"2099-01-01"}')
+check "回填缺照片被拒(400)" "$CODE2" "400"
+DEADLINE=$(python3 -c "from datetime import date,timedelta;print(date.today()+timedelta(days=7))")
+FILLED=$(req POST /api/regulatory/tasks/$SI/fill REGULATOR regulator-1 "{\"checkResult\":\"NON_COMPLIANT\",\"photoUrls\":[\"https://img.example.com/site-1.jpg\",\"https://img.example.com/site-2.jpg\"],\"interviewResult\":\"老板承认废油交无资质收运人，责令改正\",\"rectifyDeadline\":\"$DEADLINE\"}")
+check "回填后任务 RECTIFYING" "$(jget "['data']['status']" <<< "$FILLED")" "RECTIFYING"
+check "回填照片已留痕" "$(python3 -c "import sys,json;print('site-1.jpg' in json.load(sys.stdin)['data']['photoUrls'])" <<< "$FILLED")" "True"
+KEY=$(req GET /api/regulatory/risk-profiles/key-patrol REGULATOR regulator-1)
+check "门店4进入重点巡查名单" "$(python3 -c "import sys,json;print(any(p['storeId']==4 and p['riskLevel']=='KEY' for p in json.load(sys.stdin)['data']))" <<< "$KEY")" "True"
+
+# 再巡查：仍无记录，不重复生成任务，维持 KEY
+SCAN2=$(req POST /api/regulatory/patrol/scan REGULATOR regulator-1 '{}')
+check "再巡查不重复生成任务" "$(jget "['data']['tasksCreated']" <<< "$SCAN2")" "0"
+check "再巡查维持 KEY" "$(jget "['data']['riskLevel']" <<< "$(req GET /api/regulatory/risk-profiles/4 REGULATOR regulator-1)")" "KEY"
+
+# 门店 4 恢复正常回收：完整闭环一次
+curl -s -X POST "$BASE/api/weighings/devices/DEV-004/heartbeat" -H "X-Role: RECYCLER" >/dev/null
+AID6=$(jget "['data']['id']" <<< "$(req POST /api/appointments MERCHANT merchant-1 "{\"storeId\":4,\"barrelCount\":1,\"estimatedWeightKg\":100,\"windowStart\":\"$WS\",\"windowEnd\":\"$WE\"}")")
+DID6=$(jget "['data']['id']" <<< "$(req POST /api/dispatches RECYCLER recycler-1 "{\"appointmentId\":$AID6,\"vehicleId\":1,\"driverId\":1,\"plantId\":1,\"plannedStart\":\"$WS\",\"plannedEnd\":\"$WE\"}")")
+req POST /api/dispatches/$DID6/depart DRIVER driver-1 '{}' >/dev/null
+req POST /api/dispatches/$DID6/arrive DRIVER driver-1 '{}' >/dev/null
+req POST /api/dispatches/$DID6/verify DRIVER driver-1 '{"storeQr":"STORE-QR-4","deviceCode":"DEV-004","handoverName":"赵老板"}' >/dev/null
+req POST /api/weighings DRIVER driver-1 "{\"dispatchId\":$DID6,\"barrelCode\":\"BAR-301\",\"weightKg\":90,\"deviceCode\":\"DEV-004\",\"source\":\"DEVICE\",\"handoverName\":\"赵老板\"}" >/dev/null
+req POST /api/dispatches/$DID6/load-complete DRIVER driver-1 '{}' >/dev/null
+req POST /api/tracks/$DID6 DRIVER driver-1 '{"points":[{"lat":30.67,"lng":104.07}]}' >/dev/null
+req POST /api/dispatches/$DID6/arrive-plant DRIVER driver-1 '{}' >/dev/null
+MID6=$(curl -s "$BASE/api/manifests" -H "X-Role: REGULATOR" | python3 -c "
+import sys,json
+for m in json.load(sys.stdin)['data']:
+    if m['dispatchId']==$DID6: print(m['id']); break")
+req POST /api/receipts PLANT plant-1 "{\"manifestId\":$MID6,\"arrivalWeightKg\":90,\"barrelCount\":1,\"qualityCheck\":\"OK\",\"decision\":\"ACCEPT\",\"receivedBy\":\"厂验收员\"}" >/dev/null
+check "门店4恢复回收联单 CLOSED" "$(jget "['data']['manifest']['status']" <<< "$(req GET /api/manifests/$MID6 REGULATOR regulator-1)")" "CLOSED"
+
+# 两轮巡查：风险 80 → 40(WATCH) → 0(NORMAL)
+req POST /api/regulatory/patrol/scan REGULATOR regulator-1 '{}' >/dev/null
+check "首轮巡查风险分降至 40" "$(jget "['data']['riskScore']" <<< "$(req GET /api/regulatory/risk-profiles/4 REGULATOR regulator-1)")" "40"
+check "首轮巡查退出重点巡查" "$(jget "['data']['keyPatrol']" <<< "$(req GET /api/regulatory/risk-profiles/4 REGULATOR regulator-1)")" "False"
+req POST /api/regulatory/patrol/scan REGULATOR regulator-1 '{}' >/dev/null
+check "二轮巡查风险分清零" "$(jget "['data']['riskScore']" <<< "$(req GET /api/regulatory/risk-profiles/4 REGULATOR regulator-1)")" "0"
+check "二轮巡查恢复 NORMAL" "$(jget "['data']['riskLevel']" <<< "$(req GET /api/regulatory/risk-profiles/4 REGULATOR regulator-1)")" "NORMAL"
+CLOSED_TASK=$(req POST /api/regulatory/tasks/$SI/verify REGULATOR regulator-1 '{"passed":true,"closeNote":"已签订合规收运合同并恢复交运，复核通过"}')
+check "整改复核通过任务关闭" "$(jget "['data']['status']" <<< "$CLOSED_TASK")" "VERIFIED_CLOSED"
+
+echo "=== 10. Kafka 事件审计流水 ==="
 AUDIT=$(psql "postgresql://wasteoil:wasteoil123@localhost:5433/wasteoil" -tAc "SELECT count(*) FROM audit_logs" 2>/dev/null || echo "0")
 check "审计流水已落库(>20 条)" "$(python3 -c "print($AUDIT>20)")" "True"
 

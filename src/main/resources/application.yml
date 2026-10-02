@@ -52,3 +52,9 @@ wasteoil:
   risk-window-days: 90
   # 产量/预期比值低于该值进入风险名单
   risk-yield-ratio: 0.3
+  # 巡查：连续无合规回收达到该天数，标记疑似违规并自动生成现场检查任务
+  patrol-watch-days: 30
+  # 巡查：连续无合规回收达到该天数（或连续两轮巡查仍无回收），列入重点巡查名单
+  patrol-key-days: 60
+  # 巡查：恢复回收后连续巡查确认次数，达到后风险状态清零
+  patrol-recover-scans: 2
