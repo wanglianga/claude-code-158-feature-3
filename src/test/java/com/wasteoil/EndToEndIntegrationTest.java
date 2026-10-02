@@ -3,6 +3,10 @@ package com.wasteoil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wasteoil.audit.AuditLogRepository;
+import com.wasteoil.inspection.InspectionTaskRepository;
+import com.wasteoil.merchant.Store;
+import com.wasteoil.merchant.StoreRepository;
+import com.wasteoil.risk.RiskEntryRepository;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -48,6 +52,12 @@ class EndToEndIntegrationTest {
     ObjectMapper om;
     @Autowired
     AuditLogRepository auditLogRepository;
+    @Autowired
+    RiskEntryRepository riskEntryRepository;
+    @Autowired
+    InspectionTaskRepository inspectionTaskRepository;
+    @Autowired
+    StoreRepository storeRepository;
 
     // 跨用例共享的主流程产物
     static long happyManifestId;
@@ -129,6 +139,32 @@ class EndToEndIntegrationTest {
                             {"lat": 30.60, "lng": 104.10, "recordedAt": "%s"}]}
                 """.formatted(Instant.now(), Instant.now()), 200);
         postJson("/api/dispatches/" + dispatchId + "/arrive-plant", "DRIVER", "driver-1", "{}", 200);
+    }
+
+    /** 门店 3（老城大排档）完成一趟合规回收闭环，返回联单 ID */
+    private long runStore3Pickup(String barrelCode) throws Exception {
+        postJson("/api/weighings/devices/DEV-003/heartbeat", "RECYCLER", "recycler-1", "{}", 200);
+        long appointmentId = createAppointment(3, 1, "90");
+        long dispatchId = planDispatch(appointmentId, tomorrowAt(10, 0), tomorrowAt(11, 0));
+        postJson("/api/dispatches/" + dispatchId + "/depart", "DRIVER", "driver-1", "{}", 200);
+        postJson("/api/dispatches/" + dispatchId + "/arrive", "DRIVER", "driver-1", "{}", 200);
+        postJson("/api/dispatches/" + dispatchId + "/verify", "DRIVER", "driver-1", """
+                {"storeQr": "STORE-QR-3", "deviceCode": "DEV-003", "handoverName": "刘老板",
+                 "photoUrls": "https://img.example.com/store3.jpg"}
+                """, 200);
+        postJson("/api/weighings", "DRIVER", "driver-1", """
+                {"dispatchId": %d, "barrelCode": "%s", "weightKg": 80, "deviceCode": "DEV-003",
+                 "source": "DEVICE", "photoUrl": "https://img.example.com/w3.jpg",
+                 "handoverName": "刘老板"}
+                """.formatted(dispatchId, barrelCode), 200);
+        postJson("/api/dispatches/" + dispatchId + "/load-complete", "DRIVER", "driver-1", "{}", 200);
+        uploadTracksAndArrivePlant(dispatchId);
+        long manifestId = manifestIdOf(dispatchId);
+        postJson("/api/receipts", "PLANT", "plant-1", """
+                {"manifestId": %d, "arrivalWeightKg": 79, "barrelCount": 1,
+                 "qualityCheck": "OK", "decision": "ACCEPT", "receivedBy": "厂验收员"}
+                """.formatted(manifestId), 200);
+        return manifestId;
     }
 
     // ---------- 主流程 ----------
@@ -437,5 +473,147 @@ class EndToEndIntegrationTest {
 
         JsonNode trend = getJson("/api/reports/regulator/trend", "REGULATOR", 200);
         assertThat(trend.path("data").size()).isGreaterThanOrEqualTo(1);
+    }
+
+    // ---------- 监管抽查追踪扩展 ----------
+
+    @Test
+    @Order(40)
+    void 监管抽查_按商户日期批次生成完整链路() throws Exception {
+        // 按商户 + 日期区间查询（覆盖此前主流程与各异常批次）
+        String from = LocalDate.now(ZONE).minusDays(2).toString();
+        String to = LocalDate.now(ZONE).plusDays(2).toString();
+        JsonNode storeChain = getJson(
+                "/api/supervision/stores/1/chains?from=" + from + "&to=" + to, "REGULATOR", 200);
+        assertThat(storeChain.path("data").path("storeName").asText()).contains("川香");
+        assertThat(storeChain.path("data").path("batchCount").asInt()).isGreaterThanOrEqualTo(1);
+
+        // 主流程批次应包含预约/司机/车辆/到厂联单/结算完整链路
+        JsonNode happyBatch = null;
+        for (JsonNode b : storeChain.path("data").path("batches")) {
+            if (b.path("manifestId").asLong() == happyManifestId) {
+                happyBatch = b;
+            }
+        }
+        assertThat(happyBatch).isNotNull();
+        assertThat(happyBatch.path("appointment").path("storageLocation").asText()).isNotBlank();
+        assertThat(happyBatch.path("dispatch").path("driver").path("name").asText()).isEqualTo("张师傅");
+        assertThat(happyBatch.path("dispatch").path("vehicle").path("plateNo").asText()).isEqualTo("川A12345");
+        assertThat(happyBatch.path("dispatch").path("plant").path("name").asText()).contains("绿源");
+        assertThat(happyBatch.path("weighings").size()).isEqualTo(2);
+        assertThat(happyBatch.path("plantReceipt").path("decision").asText()).isEqualTo("ACCEPT");
+        assertThat(happyBatch.path("settlement").path("amount").asDouble()).isEqualTo(950.40);
+        // 该批次此前被监管抽查过（order 4 的 FAIL 登记）
+        assertThat(happyBatch.path("inspections").size()).isGreaterThanOrEqualTo(1);
+        assertThat(happyBatch.path("inspections").get(0).path("result").asText()).isEqualTo("FAIL");
+
+        // 单批次链路接口
+        JsonNode one = getJson("/api/supervision/manifests/" + happyManifestId + "/chain",
+                "REGULATOR", 200);
+        assertThat(one.path("data").path("manifestNo").asText()).startsWith("M");
+        assertThat(one.path("data").path("trackPointCount").asInt()).isEqualTo(2);
+
+        // 按街道抽查：春熙路上的门店当日应能查到商户与批次
+        JsonNode streetChains = getJson(
+                "/api/supervision/streets/春熙路/chains?date=" + LocalDate.now(ZONE),
+                "REGULATOR", 200);
+        boolean containsStore1 = false;
+        for (JsonNode c : streetChains.path("data")) {
+            if (c.path("storeId").asLong() == 1L) {
+                containsStore1 = true;
+            }
+        }
+        assertThat(containsStore1).isTrue();
+    }
+
+    @Test
+    @Order(41)
+    void 长期无回收_检查任务回填_恢复正常回收风险逐步下降() throws Exception {
+        // 门店 3 在 order(30) 的风险扫描中已因长期无回收被标记 WATCH 并自动生成现场检查任务
+        JsonNode tasks = getJson("/api/inspection-tasks/by-store/3", "REGULATOR", 200);
+        long taskId = -1;
+        for (JsonNode t : tasks.path("data")) {
+            if ("NO_RECYCLING".equals(t.path("triggerReason").asText())
+                    && "OPEN".equals(t.path("status").asText())) {
+                taskId = t.path("id").asLong();
+            }
+        }
+        assertThat(taskId).isPositive();
+
+        // 认领并回填：现场照片、约谈结果、整改期限，检查不合格
+        postJson("/api/inspection-tasks/" + taskId + "/claim", "REGULATOR", "regulator-1", "{}", 200);
+        String deadline = LocalDate.now(ZONE).plusDays(15).toString();
+        JsonNode completed = postJson("/api/inspection-tasks/" + taskId + "/complete",
+                "REGULATOR", "regulator-1", """
+                        {"inspectionPhotoUrls": "https://img.example.com/inspect1.jpg,https://img.example.com/inspect2.jpg",
+                         "interviewResult": "约谈负责人，承认前期将废油交无资质人员收运",
+                         "rectificationDeadline": "%s",
+                         "inspectionResult": "UNQUALIFIED",
+                         "note": "现场无隔油池台账，责令限期整改"}
+                        """.formatted(deadline), 200);
+        assertThat(completed.path("data").path("status").asText()).isEqualTo("COMPLETED");
+        assertThat(completed.path("data").path("inspectionPhotoUrls").asText()).contains("inspect2.jpg");
+        assertThat(completed.path("data").path("rectificationDeadline").asText()).isEqualTo(deadline);
+
+        // 检查不合格，关联风险条目被复核为 CONFIRMED
+        JsonNode risks = getJson("/api/risks", "REGULATOR", 200);
+        long store3RiskId = -1;
+        for (JsonNode r : risks.path("data")) {
+            if (r.path("storeId").asLong() == 3L && "NO_RECYCLING".equals(r.path("indicator").asText())) {
+                store3RiskId = r.path("id").asLong();
+                assertThat(r.path("status").asText()).isEqualTo("CONFIRMED");
+                assertThat(r.path("riskLevel").asText()).isEqualTo("WATCH");
+            }
+        }
+        assertThat(store3RiskId).isPositive();
+
+        // 另开一张人工检查任务，用于验证风险解除时未结任务被自动取消
+        JsonNode manual = postJson("/api/inspection-tasks", "REGULATOR", "regulator-1", """
+                {"storeId": 3, "dueDate": "%s", "note": "复查整改情况"}
+                """.formatted(LocalDate.now(ZONE).plusDays(10)), 200);
+        long manualTaskId = manual.path("data").path("id").asLong();
+
+        // 模拟"持续无回收"：将该风险升级为重点巡查
+        Store store3 = storeRepository.findById(3L).orElseThrow();
+        var riskRepo = riskEntryRepository.findById(store3RiskId).orElseThrow();
+        riskRepo.setRiskLevel(com.wasteoil.risk.RiskLevel.KEY_PATROL);
+        riskRepo.setConsecutiveNoRecyclingCycles(2);
+        riskEntryRepository.save(riskRepo);
+        assertThat(getJson("/api/risks/key-patrol", "REGULATOR", 200).path("data").size())
+                .isGreaterThanOrEqualTo(1);
+
+        // 恢复正常回收第一批：重点巡查 → 关注（逐步下降，不立即解除）
+        runStore3Pickup("BAR-201");
+        JsonNode afterFirst = getJson("/api/risks", "REGULATOR", 200);
+        for (JsonNode r : afterFirst.path("data")) {
+            if (r.path("id").asLong() == store3RiskId) {
+                assertThat(r.path("riskLevel").asText()).isEqualTo("WATCH");
+                assertThat(r.path("status").asText()).isEqualTo("CONFIRMED");
+            }
+        }
+
+        // 第二批合规回收：关注 → 解除，未结人工检查任务自动取消
+        runStore3Pickup("BAR-202");
+        JsonNode afterSecond = getJson("/api/risks", "REGULATOR", 200);
+        boolean stillActive = false;
+        for (JsonNode r : afterSecond.path("data")) {
+            if (r.path("id").asLong() == store3RiskId && !"RECOVERED".equals(r.path("status").asText())) {
+                stillActive = true;
+            }
+        }
+        assertThat(stillActive).isFalse();
+        JsonNode manualTask = getJson("/api/inspection-tasks/" + manualTaskId, "REGULATOR", 200);
+        assertThat(manualTask.path("data").path("status").asText()).isEqualTo("CANCELLED");
+
+        // 恢复后该商户当日抽查链路可见 2 个回收批次
+        JsonNode chain = getJson(
+                "/api/supervision/stores/3/chains?date=" + LocalDate.now(ZONE), "REGULATOR", 200);
+        assertThat(chain.path("data").path("batchCount").asInt()).isEqualTo(2);
+        assertThat(chain.path("data").path("batches").get(0).path("settlement").path("amount").asDouble())
+                .isGreaterThan(0);
+
+        // 监管现场检查任务事件进入审计流水
+        await().atMost(15, TimeUnit.SECONDS).until(() -> auditLogRepository.findAll().stream()
+                .anyMatch(a -> "InspectionTaskCompleted".equals(a.getEventType())));
     }
 }

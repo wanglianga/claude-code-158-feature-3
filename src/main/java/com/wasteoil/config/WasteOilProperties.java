@@ -33,4 +33,13 @@ public class WasteOilProperties {
 
     /** 产量/预期比值阈值 */
     private BigDecimal riskYieldRatio = new BigDecimal("0.3");
+
+    /** 连续多少个扫描周期无回收记录，从"关注"升级为"重点巡查" */
+    private int noRecyclingEscalateCycles = 2;
+
+    /** 现场检查任务默认办理期限（天） */
+    private int inspectionDueDays = 7;
+
+    /** 恢复正常回收后，风险逐步下降：每个扫描周期回收量达标即降一级（关注→关闭） */
+    private int riskRecoveryDecay = 1;
 }

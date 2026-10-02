@@ -12,6 +12,7 @@ import com.wasteoil.manifest.ManifestRepository;
 import com.wasteoil.manifest.ManifestService;
 import com.wasteoil.manifest.ManifestStatus;
 import com.wasteoil.plant.PlantReceipt;
+import com.wasteoil.risk.RiskAnalyzer;
 import com.wasteoil.settlement.SettlementService;
 import com.wasteoil.track.TrackPointRepository;
 import lombok.extern.slf4j.Slf4j;
@@ -39,6 +40,7 @@ public class ComplianceService {
     private final TrackPointRepository trackPointRepository;
     private final ExceptionService exceptionService;
     private final SettlementService settlementService;
+    private final RiskAnalyzer riskAnalyzer;
     private final EventPublisher eventPublisher;
     private final WasteOilProperties properties;
 
@@ -48,6 +50,7 @@ public class ComplianceService {
                              TrackPointRepository trackPointRepository,
                              ExceptionService exceptionService,
                              SettlementService settlementService,
+                             RiskAnalyzer riskAnalyzer,
                              EventPublisher eventPublisher,
                              WasteOilProperties properties) {
         this.manifestRepository = manifestRepository;
@@ -56,6 +59,7 @@ public class ComplianceService {
         this.trackPointRepository = trackPointRepository;
         this.exceptionService = exceptionService;
         this.settlementService = settlementService;
+        this.riskAnalyzer = riskAnalyzer;
         this.eventPublisher = eventPublisher;
         this.properties = properties;
     }
@@ -175,5 +179,7 @@ public class ComplianceService {
     private void closeLoop(Manifest manifest) {
         settlementService.createFor(manifest);
         manifestService.transition(manifest, ManifestStatus.CLOSED, "ManifestClosed");
+        // 产生新的合规回收批次：若该门店存在长期无回收风险，风险状态逐步下降
+        riskAnalyzer.notifyPickup(manifest);
     }
 }

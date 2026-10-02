@@ -33,7 +33,8 @@ public class AuditConsumer {
             KafkaTopics.TRACK_EVENTS,
             KafkaTopics.MANIFEST_EVENTS,
             KafkaTopics.EXCEPTION_EVENTS,
-            KafkaTopics.COMPLIANCE_EVENTS
+            KafkaTopics.COMPLIANCE_EVENTS,
+            KafkaTopics.SUPERVISION_EVENTS
     }, groupId = "waste-oil-audit")
     public void onEvent(@Payload String message,
                         @Header(KafkaHeaders.RECEIVED_TOPIC) String topic) {

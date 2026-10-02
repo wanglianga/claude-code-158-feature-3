@@ -11,6 +11,7 @@ import com.wasteoil.manifest.ManifestRepository;
 import com.wasteoil.manifest.ManifestService;
 import com.wasteoil.manifest.ManifestStatus;
 import com.wasteoil.plant.PlantReceipt;
+import com.wasteoil.risk.RiskAnalyzer;
 import com.wasteoil.settlement.SettlementService;
 import com.wasteoil.track.TrackPointRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -45,6 +46,8 @@ class ComplianceServiceTest {
     @Mock
     SettlementService settlementService;
     @Mock
+    RiskAnalyzer riskAnalyzer;
+    @Mock
     EventPublisher eventPublisher;
 
     ComplianceService service;
@@ -53,7 +56,8 @@ class ComplianceServiceTest {
     void setUp() {
         WasteOilProperties props = new WasteOilProperties();
         service = new ComplianceService(manifestRepository, manifestService, dispatchRepository,
-                trackPointRepository, exceptionService, settlementService, eventPublisher, props);
+                trackPointRepository, exceptionService, settlementService, riskAnalyzer,
+                eventPublisher, props);
         lenient().when(manifestRepository.save(any())).thenAnswer(i -> i.getArgument(0));
         DispatchOrder dispatch = new DispatchOrder();
         dispatch.setId(1L);

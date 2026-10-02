@@ -52,3 +52,9 @@ wasteoil:
   risk-window-days: 90
   # 产量/预期比值低于该值进入风险名单
   risk-yield-ratio: 0.3
+  # 连续多少个扫描周期无回收记录，由"关注"升级为"重点巡查"
+  no-recycling-escalate-cycles: 2
+  # 现场检查任务默认办理期限（天）
+  inspection-due-days: 7
+  # 恢复正常回收后每出现一批合规回收风险下降一级（关注→关闭）
+  risk-recovery-decay: 1
